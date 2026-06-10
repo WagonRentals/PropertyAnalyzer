@@ -41,6 +41,7 @@ import requests
 import streamlit as st
 from folium.plugins import MeasureControl
 from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailable
 from shapely.geometry import MultiPoint, Point
 
 from lsv_competitor_scorer import score_market, MarketResult
@@ -200,8 +201,21 @@ def geocode(address: str) -> list[GeoCandidate]:
     if cache.exists():
         return [GeoCandidate(**c) for c in json.loads(cache.read_text())]
 
-    geolocator = Nominatim(user_agent="lsv_property_scorer")
-    locs = geolocator.geocode(address, exactly_one=False, limit=5, addressdetails=True)
+    # Nominatim's default 1s timeout is far too short from a cloud host, where
+    # the public OSM endpoint is slower and rate-limited. Give it room and retry
+    # a couple of times on transient timeouts / unavailability.
+    geolocator = Nominatim(user_agent="wagon-property-analyzer", timeout=10)
+    locs, last_err = None, None
+    for attempt in range(3):
+        try:
+            locs = geolocator.geocode(address, exactly_one=False, limit=5,
+                                      addressdetails=True)
+            break
+        except (GeocoderTimedOut, GeocoderUnavailable, GeocoderServiceError) as e:
+            last_err = e
+            time.sleep(1.0 * (attempt + 1))
+    if locs is None and last_err is not None:
+        raise last_err  # surfaced as a friendly message by the caller
     out = []
     for loc in (locs or []):
         out.append(GeoCandidate(address=loc.address, lat=loc.latitude, lon=loc.longitude))
@@ -657,7 +671,13 @@ def main():
 
     if submitted and address.strip():
         with st.spinner("Geocoding…"):
-            candidates = geocode(address.strip())
+            try:
+                candidates = geocode(address.strip())
+            except Exception:
+                st.error("Address lookup (OpenStreetMap Nominatim) is temporarily "
+                         "unavailable or rate-limited from the server. Please wait a "
+                         "few seconds and try again.")
+                st.stop()
         if not candidates:
             st.error("Could not geocode that address. Try adding city/state/ZIP.")
             return
