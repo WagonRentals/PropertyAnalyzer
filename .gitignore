@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Secrets — never commit API keys
+.streamlit/secrets.toml
+.env
+
+# Local caches (regenerated at runtime)
+.competitor_cache/
+.faa_cache/
+.marina_cache/
+.property_scorer_cache/
+cache/
+*.pkl
+
+# Generated outputs
+*.html
+*_results.csv
+*_scores.csv
+*_checkpoint.json
+
+# OS
+.DS_Store
