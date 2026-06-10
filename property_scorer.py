@@ -82,6 +82,11 @@ STR_EXCLUDE_TYPE_KEYWORDS = ["condo", "apartment", "rental unit",
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 
+# Simple access gate. Reads APP_PASSWORD from env/Streamlit secrets; defaults to
+# "wagon". NOTE: the repo is public, so set APP_PASSWORD in Streamlit Secrets to
+# avoid relying on this visible default.
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "wagon")
+
 # STR nightly price bands (label, lower, upper)
 PRICE_BANDS = [
     ("Budget", 0, 100), ("Mid-range", 100, 200), ("Upscale", 200, 400),
@@ -724,8 +729,26 @@ def render_results(lat: float, lon: float, resolved: str, radius: float):
             st.warning("OSM network too sparse for full road analysis.")
 
 
+def require_password():
+    """Gate the app behind a shared password (stops strangers from spending API
+    budget). Returns once authenticated; otherwise renders the prompt and halts."""
+    if st.session_state.get("authed"):
+        return
+    st.image(LOGO_URL, width=120)
+    st.markdown("### Property Analyzer")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if pw == APP_PASSWORD:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+
 def main():
     st.set_page_config(page_title="Property Analyzer", page_icon=LOGO_URL, layout="wide")
+    require_password()
 
     logo_col, title_col = st.columns([1, 4], vertical_alignment="center")
     logo_col.image(LOGO_URL, width=110)
