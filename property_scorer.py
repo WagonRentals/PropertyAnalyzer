@@ -87,7 +87,7 @@ PRICE_BANDS = [
     ("Budget", 0, 100), ("Mid-range", 100, 200), ("Upscale", 200, 400),
     ("Luxury", 400, 800), ("Ultra-luxury", 800, 1600),
 ]
-PRICE_BAR_MAX = 1600
+PRICE_BAR_MAX = 1000
 
 # LSV scoring thresholds
 VICINITY_RADIUS_M = 400               # ~0.25 mi
@@ -618,14 +618,14 @@ def pricing_bar_html(adr: float) -> str:
     return f"""
     <div style="margin: 8px 0 4px;">
       <div style="position: relative; height: 22px; border-radius: 4px;
-           background: linear-gradient(to right,#66bb6a 0%,#9ccc65 20%,#ffee58 40%,
-           #ffa726 65%,#ef5350 100%);">
-        <div style="position:absolute; left:{pct:.1f}%; top:-4px; transform:translateX(-50%);
-             font-weight:bold; color:#222;">▼</div>
+           background: linear-gradient(to right,#66bb6a 0%,#9ccc65 10%,#ffee58 20%,
+           #ffa726 40%,#ef5350 80%);">
+        <div style="position:absolute; left:{pct:.1f}%; top:-7px; transform:translateX(-50%);
+             font-size:15px; font-weight:bold; color:#111;">▼</div>
       </div>
       <div style="display:flex; justify-content:space-between; font-size:10px; color:#666;">
-        <span>$0</span><span>$100</span><span>$200</span><span>$400</span>
-        <span>$800</span><span>$1600+</span>
+        <span>$0</span><span>$200</span><span>$400</span><span>$600</span>
+        <span>$800</span><span>$1000+</span>
       </div>
       <div style="text-align:center; margin-top:4px; font-weight:600;">{label}</div>
     </div>
