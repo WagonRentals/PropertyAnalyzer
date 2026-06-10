@@ -195,33 +195,58 @@ def _median(xs: list[float]) -> float:
 # Geocoding (Nominatim)
 # ---------------------------------------------------------------------------
 
+GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+
+def _geocode_nominatim(address: str) -> list[GeoCandidate]:
+    """Primary geocoder (free OSM). Returns [] on any failure so we can fall
+    back. Timeout is generous because the public endpoint is slow from servers."""
+    try:
+        geolocator = Nominatim(user_agent="wagon-property-analyzer", timeout=8)
+        locs = geolocator.geocode(address, exactly_one=False, limit=5,
+                                  addressdetails=True)
+    except (GeocoderTimedOut, GeocoderUnavailable, GeocoderServiceError):
+        return []
+    return [GeoCandidate(address=l.address, lat=l.latitude, lon=l.longitude)
+            for l in (locs or [])]
+
+
+def _geocode_google(address: str) -> list[GeoCandidate]:
+    """Fallback geocoder using the Google Geocoding API (reliable from cloud
+    hosts). Requires the Geocoding API to be enabled on the GOOGLE_PLACES key."""
+    if not GOOGLE_API_KEY:
+        return []
+    try:
+        data = requests.get(GOOGLE_GEOCODE_URL,
+                            params={"address": address, "key": GOOGLE_API_KEY},
+                            timeout=15).json()
+    except requests.RequestException:
+        return []
+    if data.get("status") != "OK":
+        return []
+    out = []
+    for res in data.get("results", [])[:5]:
+        loc = res.get("geometry", {}).get("location", {})
+        if "lat" in loc and "lng" in loc:
+            out.append(GeoCandidate(address=res.get("formatted_address", address),
+                                    lat=loc["lat"], lon=loc["lng"]))
+    return out
+
+
 def geocode(address: str) -> list[GeoCandidate]:
+    """Geocode an address: Nominatim first, Google as a fallback. Cached per
+    address so repeats are instant and free."""
     key = "".join(c if c.isalnum() else "_" for c in address.lower())[:80]
     cache = GEOCODE_DIR / f"{key}.json"
     if cache.exists():
         return [GeoCandidate(**c) for c in json.loads(cache.read_text())]
 
-    # Nominatim's default 1s timeout is far too short from a cloud host, where
-    # the public OSM endpoint is slower and rate-limited. Give it room and retry
-    # a couple of times on transient timeouts / unavailability.
-    geolocator = Nominatim(user_agent="wagon-property-analyzer", timeout=10)
-    locs, last_err = None, None
-    for attempt in range(3):
-        try:
-            locs = geolocator.geocode(address, exactly_one=False, limit=5,
-                                      addressdetails=True)
-            break
-        except (GeocoderTimedOut, GeocoderUnavailable, GeocoderServiceError) as e:
-            last_err = e
-            time.sleep(1.0 * (attempt + 1))
-    if locs is None and last_err is not None:
-        raise last_err  # surfaced as a friendly message by the caller
-    out = []
-    for loc in (locs or []):
-        out.append(GeoCandidate(address=loc.address, lat=loc.latitude, lon=loc.longitude))
-    if out:
-        cache.write_text(json.dumps([asdict(c) for c in out]))
-    return out
+    candidates = _geocode_nominatim(address)
+    if not candidates:
+        candidates = _geocode_google(address)   # licensed, server-reliable fallback
+    if candidates:
+        cache.write_text(json.dumps([asdict(c) for c in candidates]))
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +704,9 @@ def main():
                          "few seconds and try again.")
                 st.stop()
         if not candidates:
-            st.error("Could not geocode that address. Try adding city/state/ZIP.")
+            st.error("Couldn't find that address (tried OpenStreetMap, then Google). "
+                     "Check the spelling or add city/state/ZIP. If this keeps happening, "
+                     "make sure the **Geocoding API** is enabled on your Google key.")
             return
         st.session_state["candidates"] = [asdict(c) for c in candidates]
         st.session_state["radius"] = radius
