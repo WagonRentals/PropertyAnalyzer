@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import pickle
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -390,14 +389,23 @@ def fetch_str_airroi(lat: float, lon: float, radius_miles: float) -> STRResult:
 # ---------------------------------------------------------------------------
 
 def _lsv_cache(lat: float, lon: float, radius: float) -> Path:
-    return LSV_DIR / f"{lat:.4f}_{lon:.4f}_r{radius:g}.pkl"
+    return LSV_DIR / f"{lat:.4f}_{lon:.4f}_r{radius:g}.json"
+
+
+def _lsv_json_default(o):
+    """Coerce numpy scalars (np.float64/np.int64/np.bool_) to native types."""
+    if hasattr(o, "item"):
+        return o.item()
+    raise TypeError(f"not JSON serializable: {type(o).__name__}")
 
 
 def analyze_lsv_safety(lat: float, lon: float, radius_miles: float) -> LSVResult:
     cache = _lsv_cache(lat, lon, radius_miles)
     if cache.exists():
-        with open(cache, "rb") as f:
-            return pickle.load(f)
+        try:
+            return LSVResult(**json.loads(cache.read_text()))
+        except Exception:
+            pass  # stale/corrupt cache — fall through and recompute
 
     radius_m = min(int(radius_miles * METERS_PER_MILE), 8000)
     warnings: list[str] = []
@@ -508,8 +516,11 @@ def analyze_lsv_safety(lat: float, lon: float, radius_miles: float) -> LSVResult
         all_geojson=_gj(G, lambda d: True),
         isochrone_coords=iso_coords,
     )
-    with open(cache, "wb") as f:
-        pickle.dump(result, f)
+    # Caching is best-effort — a serialization/disk hiccup must never crash the app.
+    try:
+        cache.write_text(json.dumps(asdict(result), default=_lsv_json_default))
+    except Exception:
+        pass
     return result
 
 
