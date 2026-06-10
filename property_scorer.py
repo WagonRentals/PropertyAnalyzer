@@ -74,6 +74,12 @@ AIRROI_PAGE_SIZE = 10         # AirROI caps pageSize at 10
 AIRROI_MAX_PAGES = 20         # up to ~200 listings/address (cost/time guard)
 AIRROI_EST_COST = "$0.25–1.50"
 
+# STR filtering — focus comps on whole, single-family-style houses. room_type
+# must be entire_home, and we drop condo/apartment-style listing_types. (Airbnb
+# has no true "detached SFH" flag, so this is the closest honest filter.)
+STR_EXCLUDE_TYPE_KEYWORDS = ["condo", "apartment", "rental unit",
+                             "serviced apartment", "aparthotel", "loft", "hotel"]
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 
 # STR nightly price bands (label, lower, upper)
@@ -113,7 +119,8 @@ class STRResult:
     available: bool
     median_adr: float = 0.0
     avg_adr: float = 0.0
-    listing_count: int = 0
+    listing_count: int = 0       # entire-home (non-condo) listings within radius
+    total_market: int = 0        # all listings of any type in the area (context)
     pct_entire: float = 0.0
     pct_private: float = 0.0
     pct_shared: float = 0.0
@@ -317,6 +324,58 @@ def load_str_cache(lat: float, lon: float, radius: float) -> Optional[STRResult]
     return None
 
 
+def _str_listing_ok(L: dict) -> bool:
+    """Keep only entire-home listings, excluding condo/apartment listing_types so
+    the comps reflect whole single-family-style houses."""
+    li = L.get("listing_info") or {}
+    if str(li.get("room_type", "")).lower() != "entire_home":
+        return False
+    ltype = str(li.get("listing_type", "")).lower()
+    return not any(kw in ltype for kw in STR_EXCLUDE_TYPE_KEYWORDS)
+
+
+def _aggregate_listings(listings: list[dict], total_count: int,
+                        lat: float, lon: float, radius_miles: float) -> STRResult:
+    """Build an STRResult from AirROI's nested listing objects, geofenced to the
+    radius and filtered to entire-home (non-condo) houses. Fields live under
+    sub-objects: location_info.{latitude,longitude}, performance_metrics.ttm_avg_rate,
+    listing_info.{room_type,listing_type}, ratings.rating_overall."""
+    total_market = int(total_count or 0)
+    kept = []
+    for L in listings:
+        loc = L.get("location_info") or {}
+        la, lo = loc.get("latitude"), loc.get("longitude")
+        if la is None or lo is None:
+            continue
+        if haversine_miles(lat, lon, la, lo) > radius_miles:
+            continue
+        if _str_listing_ok(L):
+            kept.append(L)
+
+    if not kept:
+        return STRResult(available=False, total_market=total_market,
+                         message="No entire-home (non-condo) listings found nearby.")
+
+    rates, ratings = [], []
+    for L in kept:
+        pm = L.get("performance_metrics") or {}
+        rr = L.get("ratings") or {}
+        if pm.get("ttm_avg_rate"):
+            rates.append(pm["ttm_avg_rate"])
+        if rr.get("rating_overall"):
+            ratings.append(rr["rating_overall"])
+
+    return STRResult(
+        available=True,
+        median_adr=round(_median(rates), 0),
+        avg_adr=round(sum(rates) / len(rates), 0) if rates else 0.0,
+        listing_count=len(kept),
+        total_market=total_market,
+        pct_entire=100.0,
+        median_rating=round(_median(ratings), 2),
+    )
+
+
 def fetch_str_airroi(lat: float, lon: float, radius_miles: float) -> STRResult:
     """Query AirROI polygon search, aggregate listing stats, cache 30 days."""
     if not AIRROI_API_KEY:
@@ -324,7 +383,8 @@ def fetch_str_airroi(lat: float, lon: float, radius_miles: float) -> STRResult:
 
     polygon = circle_polygon(lat, lon, radius_miles, n_vertices=32)
     headers = {"x-api-key": AIRROI_API_KEY, "Content-Type": "application/json"}
-    listings: list[dict] = []
+    listings: dict = {}        # dedup by listing_id across pages
+    total_count = 0
     try:
         for page in range(1, AIRROI_MAX_PAGES + 1):
             body = {
@@ -342,44 +402,21 @@ def fetch_str_airroi(lat: float, lon: float, radius_miles: float) -> STRResult:
                 return STRResult(available=False,
                                  message=f"AirROI HTTP {resp.status_code}: {resp.text[:200]}")
             payload = resp.json()
+            total_count = payload.get("pagination", {}).get("total_count", total_count)
             batch = _extract_listings(payload)
-            if not batch:
-                break
-            listings.extend(batch)
-            if len(batch) < AIRROI_PAGE_SIZE:
+            new = 0
+            for L in batch:
+                lid = (L.get("listing_info") or {}).get("listing_id") or id(L)
+                if lid not in listings:
+                    listings[lid] = L
+                    new += 1
+            if new == 0 or len(batch) < AIRROI_PAGE_SIZE:
                 break
     except requests.RequestException as e:
         return STRResult(available=False, message=f"AirROI request failed: {e}")
+    listings = list(listings.values())
 
-    # Geofence precisely to the radius (the 32-gon slightly under/over-shoots).
-    kept = []
-    for L in listings:
-        la, lo = L.get("latitude"), L.get("longitude")
-        if la is None or lo is None:
-            continue
-        if haversine_miles(lat, lon, la, lo) <= radius_miles:
-            kept.append(L)
-
-    if not kept:
-        res = STRResult(available=False, message="STR data unavailable in this market.")
-        _str_cache(lat, lon, radius_miles).write_text(json.dumps(asdict(res)))
-        return res
-
-    rates = [L.get("ttm_avg_rate") for L in kept if L.get("ttm_avg_rate")]
-    ratings = [L.get("rating_overall") for L in kept if L.get("rating_overall")]
-    n = len(kept)
-    rt = [str(L.get("room_type", "")).lower() for L in kept]
-    pct = lambda kind: round(100 * sum(1 for r in rt if kind in r) / n, 1) if n else 0.0
-    res = STRResult(
-        available=True,
-        median_adr=round(_median(rates), 0),
-        avg_adr=round(sum(rates) / len(rates), 0) if rates else 0.0,
-        listing_count=n,
-        pct_entire=pct("entire"),
-        pct_private=pct("private"),
-        pct_shared=pct("shared"),
-        median_rating=round(_median(ratings), 2),
-    )
+    res = _aggregate_listings(listings, total_count, lat, lon, radius_miles)
     _str_cache(lat, lon, radius_miles).write_text(json.dumps(asdict(res)))
     return res
 
@@ -657,14 +694,14 @@ def render_results(lat: float, lon: float, resolved: str, radius: float):
             if not cached.available:
                 st.warning(cached.message or "STR data unavailable.")
             else:
-                st.metric("Median ADR (TTM)", f"${cached.median_adr:,.0f}")
+                st.metric("Median ADR (TTM, entire homes)", f"${cached.median_adr:,.0f}")
                 st.markdown(pricing_bar_html(cached.median_adr), unsafe_allow_html=True)
-                st.caption(f"{cached.listing_count} active listings within {radius:g} mi")
+                st.caption(f"{cached.listing_count} entire-home listings within {radius:g} mi "
+                           f"· {cached.total_market} total listings in area")
                 st.markdown(
-                    f"- **{cached.pct_entire:.0f}%** entire homes · "
-                    f"{cached.pct_private:.0f}% private · {cached.pct_shared:.0f}% shared\n"
                     f"- Median rating: **⭐{cached.median_rating}**\n"
-                    f"- Avg ADR: ${cached.avg_adr:,.0f}")
+                    f"- Avg ADR: ${cached.avg_adr:,.0f}\n"
+                    f"- _Condos & apartments excluded_")
 
     # ---- Column 3: LSV safety ----
     with col3:
